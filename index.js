@@ -310,6 +310,7 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
       success: true,
       noteId: note.id,
       contactId,
+      contactUrl: `https://app.hubspot.com/contacts/145521027/record/0-1/${contactId}`,
       previousCompanyIds: updatedIds,
       timestamp
     });
