@@ -26,18 +26,8 @@ app.use(express.json());
 // Joi validation schema
 const requestSchema = Joi.object({
   contactId: Joi.string().required(),
-  primaryCompany: Joi.object({
-    id: Joi.string().required(),
-    name: Joi.string().required(),
-    domain: Joi.string().allow('', null)
-  }).required(),
-  removedCompanies: Joi.array().items(
-    Joi.object({
-      id: Joi.string().required(),
-      name: Joi.string().required(),
-      domain: Joi.string().allow('', null)
-    })
-  ).min(1).required()
+  primaryCompanyId: Joi.string().required(),
+  removedCompanyIds: Joi.string().required()
 });
 
 // Constant-time comparison for API key authentication
@@ -123,6 +113,33 @@ async function getContactProperty(contactId, property) {
 
   const data = await response.json();
   return data.properties?.[property] || '';
+}
+
+// HubSpot API: Get company details
+async function getCompanyDetails(companyId) {
+  const hubspotKey = process.env.HUBSPOT_API_KEY;
+
+  const response = await fetch(
+    `https://api.hubapi.com/crm/v3/objects/companies/${companyId}?properties=name,domain`,
+    {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${hubspotKey}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`HubSpot API error fetching company ${companyId}: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return {
+    id: companyId,
+    name: data.properties?.name || 'Unknown',
+    domain: data.properties?.domain || null
+  };
 }
 
 // HubSpot API: Update contact property
@@ -217,7 +234,7 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
       });
     }
 
-    const { contactId, primaryCompany, removedCompanies } = value;
+    const { contactId, primaryCompanyId, removedCompanyIds } = value;
 
     // Check HubSpot API key is configured
     if (!process.env.HUBSPOT_API_KEY) {
@@ -225,26 +242,35 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
       return res.status(500).json({ error: 'Server configuration error' });
     }
 
+    // Parse removed company IDs
+    const removedIds = removedCompanyIds.split(',').map(id => id.trim()).filter(Boolean);
+    if (removedIds.length === 0) {
+      return res.status(400).json({ error: 'No valid removed company IDs provided' });
+    }
+
+    // Fetch company details from HubSpot (primary + all removed in parallel)
+    const [primaryCompany, ...removedCompanies] = await Promise.all([
+      getCompanyDetails(primaryCompanyId),
+      ...removedIds.map(id => getCompanyDetails(id))
+    ]);
+
     const timestamp = new Date().toISOString();
 
-    // Get current removed_company_ids value
-    let currentIds = await getContactProperty(contactId, 'removed_company_ids');
+    // Get current previous_company_ids value
+    let currentIds = await getContactProperty(contactId, 'previous_company_ids');
 
-    // Append new IDs (comma-separated)
-    const newIds = removedCompanies.map(c => c.id);
+    // Append new IDs (comma-separated, avoiding duplicates)
     let updatedIds;
-
     if (currentIds && currentIds.trim()) {
-      // Parse existing IDs and add new ones (avoiding duplicates)
       const existingSet = new Set(currentIds.split(',').map(id => id.trim()).filter(Boolean));
-      newIds.forEach(id => existingSet.add(id));
+      removedIds.forEach(id => existingSet.add(id));
       updatedIds = Array.from(existingSet).join(',');
     } else {
-      updatedIds = newIds.join(',');
+      updatedIds = removedIds.join(',');
     }
 
     // Update the contact property
-    await updateContactProperty(contactId, 'removed_company_ids', updatedIds);
+    await updateContactProperty(contactId, 'previous_company_ids', updatedIds);
 
     // Create the audit note
     const noteBody = formatNoteBody(primaryCompany, removedCompanies, timestamp);
@@ -254,7 +280,7 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
       success: true,
       noteId: note.id,
       contactId,
-      removedCompanyIds: updatedIds,
+      previousCompanyIds: updatedIds,
       timestamp
     });
 
