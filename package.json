@@ -1,0 +1,31 @@
+{
+  "name": "hubspot-audit-note",
+  "version": "1.0.0",
+  "description": "Service to create HubSpot notes documenting removed company associations",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joelblackburn-ui/hubspot-audit-note.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/joelblackburn-ui/hubspot-audit-note/issues"
+  },
+  "homepage": "https://github.com/joelblackburn-ui/hubspot-audit-note#readme",
+  "dependencies": {
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
+    "helmet": "^8.1.0",
+    "joi": "^18.1.2"
+  }
+}
