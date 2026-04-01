@@ -7,6 +7,9 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Trust proxy (Railway runs behind a proxy)
+app.set('trust proxy', 1);
+
 // Security: Helmet headers
 app.use(helmet());
 
@@ -61,7 +64,7 @@ function authenticateApiKey(req, res, next) {
 }
 
 // HubSpot API fetch wrapper with retry and exponential backoff
-async function hubspotFetch(url, options, retries = 3) {
+async function hubspotFetch(url, options, retries = 5) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     const response = await fetch(url, options);
 
@@ -70,7 +73,11 @@ async function hubspotFetch(url, options, retries = 3) {
     // Retry on rate limit (429) or server errors (5xx)
     if ((response.status === 429 || response.status >= 500) && attempt < retries) {
       const retryAfter = response.headers.get('Retry-After');
-      const delay = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 500;
+      // Base delay: 1s, 2s, 4s, 8s with jitter
+      const baseDelay = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 1000;
+      const jitter = Math.random() * 500;
+      const delay = baseDelay + jitter;
+      console.log(`HubSpot rate limited, retry ${attempt}/${retries} after ${Math.round(delay)}ms`);
       await new Promise(r => setTimeout(r, delay));
       continue;
     }
