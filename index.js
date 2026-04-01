@@ -116,12 +116,13 @@ function formatNoteBody(primaryCompany, removedCompanies, timestamp) {
   return body;
 }
 
-// HubSpot API: Get current contact property value
-async function getContactProperty(contactId, property) {
+// HubSpot API: Get current contact properties (accepts array of property names)
+async function getContactProperties(contactId, properties) {
   const hubspotKey = process.env.HUBSPOT_API_KEY;
+  const propertyList = Array.isArray(properties) ? properties.join(',') : properties;
 
   const response = await hubspotFetch(
-    `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}?properties=${property}`,
+    `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}?properties=${propertyList}`,
     {
       method: 'GET',
       headers: {
@@ -133,13 +134,13 @@ async function getContactProperty(contactId, property) {
 
   if (!response.ok) {
     if (response.status === 404) {
-      return null;
+      return {};
     }
     throw new Error(`HubSpot API error: ${response.status}`);
   }
 
   const data = await response.json();
-  return data.properties?.[property] || '';
+  return data.properties || {};
 }
 
 // HubSpot API: Batch fetch company details
@@ -155,7 +156,7 @@ async function batchGetCompanies(companyIds) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        properties: ['name', 'domain'],
+        properties: ['name', 'domain', 'customer_status'],
         inputs: companyIds.map(id => ({ id }))
       })
     }
@@ -167,20 +168,21 @@ async function batchGetCompanies(companyIds) {
 
   const data = await response.json();
 
-  // Return as map: { id: { id, name, domain } }
+  // Return as map: { id: { id, name, domain, customerStatus } }
   const companyMap = {};
   for (const result of data.results || []) {
     companyMap[result.id] = {
       id: result.id,
       name: result.properties?.name || 'Unknown',
-      domain: result.properties?.domain || null
+      domain: result.properties?.domain || null,
+      customerStatus: result.properties?.customer_status || null
     };
   }
   return companyMap;
 }
 
-// HubSpot API: Update contact property
-async function updateContactProperty(contactId, property, value) {
+// HubSpot API: Update contact properties (accepts object of properties)
+async function updateContactProperties(contactId, properties) {
   const hubspotKey = process.env.HUBSPOT_API_KEY;
 
   const response = await hubspotFetch(
@@ -191,11 +193,7 @@ async function updateContactProperty(contactId, property, value) {
         'Authorization': `Bearer ${hubspotKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        properties: {
-          [property]: value
-        }
-      })
+      body: JSON.stringify({ properties })
     }
   );
 
@@ -289,16 +287,20 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
     const allCompanyIds = [primaryCompanyId, ...removedIds];
     const companyMap = await batchGetCompanies(allCompanyIds);
 
-    const primaryCompany = companyMap[primaryCompanyId] || { id: primaryCompanyId, name: 'Unknown', domain: null };
-    const removedCompanies = removedIds.map(id => companyMap[id] || { id, name: 'Unknown', domain: null });
+    const primaryCompany = companyMap[primaryCompanyId] || { id: primaryCompanyId, name: 'Unknown', domain: null, customerStatus: null };
+    const removedCompanies = removedIds.map(id => companyMap[id] || { id, name: 'Unknown', domain: null, customerStatus: null });
 
     const timestamp = new Date().toISOString();
 
-    // Get current previous_company_ids value
-    let currentIds = await getContactProperty(contactId, 'previous_company_ids');
+    // Get current contact properties
+    const contactProps = await getContactProperties(contactId, [
+      'previous_company_ids',
+      'former_employers_that_are_customers'
+    ]);
 
-    // Append new IDs (comma-separated, avoiding duplicates)
+    // Append new IDs to previous_company_ids (avoiding duplicates)
     let updatedIds;
+    const currentIds = contactProps.previous_company_ids || '';
     if (currentIds && currentIds.trim()) {
       const existingSet = new Set(currentIds.split(',').map(id => id.trim()).filter(Boolean));
       removedIds.forEach(id => existingSet.add(id));
@@ -307,22 +309,56 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
       updatedIds = removedIds.join(',');
     }
 
-    // Update the contact property
-    await updateContactProperty(contactId, 'previous_company_ids', updatedIds);
+    // Check for removed companies that are customers
+    const customerCompanies = removedCompanies.filter(c =>
+      c.customerStatus && c.customerStatus.toLowerCase().includes('customer')
+    );
+
+    // Build properties to update
+    const propertiesToUpdate = {
+      previous_company_ids: updatedIds
+    };
+
+    // If any removed companies are customers, update the customer fields
+    let formerCustomerEmployers = null;
+    if (customerCompanies.length > 0) {
+      // Set checkbox to true
+      propertiesToUpdate.former_employee_of_customer = true;
+
+      // Append customer company names (avoiding duplicates)
+      const currentCustomerEmployers = contactProps.former_employers_that_are_customers || '';
+      const existingNames = new Set(
+        currentCustomerEmployers.split(',').map(n => n.trim()).filter(Boolean)
+      );
+      customerCompanies.forEach(c => existingNames.add(c.name));
+      formerCustomerEmployers = Array.from(existingNames).join(', ');
+      propertiesToUpdate.former_employers_that_are_customers = formerCustomerEmployers;
+    }
+
+    // Update all contact properties in one call
+    await updateContactProperties(contactId, propertiesToUpdate);
 
     // Create the audit note
     const noteBody = formatNoteBody(primaryCompany, removedCompanies, timestamp);
     const note = await createNote(contactId, noteBody);
 
     const portalId = process.env.HUBSPOT_PORTAL_ID || '4708159';
-    res.json({
+    const response = {
       success: true,
       noteId: note.id,
       contactId,
       contactUrl: `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}`,
       previousCompanyIds: updatedIds,
       timestamp
-    });
+    };
+
+    // Add customer fields if any removed companies were customers
+    if (customerCompanies.length > 0) {
+      response.formerEmployeeOfCustomer = true;
+      response.formerEmployersThatAreCustomers = formerCustomerEmployers;
+    }
+
+    res.json(response);
 
   } catch (err) {
     console.error('Error processing audit note:', err.message);
