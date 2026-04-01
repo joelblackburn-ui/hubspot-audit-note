@@ -81,7 +81,8 @@ async function hubspotFetch(url, options, retries = 3) {
 
 // Format note body
 function formatNoteBody(primaryCompany, removedCompanies, timestamp) {
-  const hubspotBaseUrl = 'https://app.hubspot.com/contacts/145521027/record/0-2';
+  const portalId = process.env.HUBSPOT_PORTAL_ID || '4708159';
+  const hubspotBaseUrl = `https://app.hubspot.com/contacts/${portalId}/record/0-2`;
 
   let body = '=== COMPANY ASSOCIATION AUDIT ===\n\n';
 
@@ -306,11 +307,12 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
     const noteBody = formatNoteBody(primaryCompany, removedCompanies, timestamp);
     const note = await createNote(contactId, noteBody);
 
+    const portalId = process.env.HUBSPOT_PORTAL_ID || '4708159';
     res.json({
       success: true,
       noteId: note.id,
       contactId,
-      contactUrl: `https://app.hubspot.com/contacts/145521027/record/0-1/${contactId}`,
+      contactUrl: `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}`,
       previousCompanyIds: updatedIds,
       timestamp
     });
