@@ -60,6 +60,25 @@ function authenticateApiKey(req, res, next) {
   next();
 }
 
+// HubSpot API fetch wrapper with retry and exponential backoff
+async function hubspotFetch(url, options, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const response = await fetch(url, options);
+
+    if (response.ok) return response;
+
+    // Retry on rate limit (429) or server errors (5xx)
+    if ((response.status === 429 || response.status >= 500) && attempt < retries) {
+      const retryAfter = response.headers.get('Retry-After');
+      const delay = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 500;
+      await new Promise(r => setTimeout(r, delay));
+      continue;
+    }
+
+    return response; // Return failed response for caller to handle
+  }
+}
+
 // Format note body
 function formatNoteBody(primaryCompany, removedCompanies, timestamp) {
   const hubspotBaseUrl = 'https://app.hubspot.com/contacts/145521027/record/0-2';
@@ -93,7 +112,7 @@ function formatNoteBody(primaryCompany, removedCompanies, timestamp) {
 async function getContactProperty(contactId, property) {
   const hubspotKey = process.env.HUBSPOT_API_KEY;
 
-  const response = await fetch(
+  const response = await hubspotFetch(
     `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}?properties=${property}`,
     {
       method: 'GET',
@@ -115,38 +134,48 @@ async function getContactProperty(contactId, property) {
   return data.properties?.[property] || '';
 }
 
-// HubSpot API: Get company details
-async function getCompanyDetails(companyId) {
+// HubSpot API: Batch fetch company details
+async function batchGetCompanies(companyIds) {
   const hubspotKey = process.env.HUBSPOT_API_KEY;
 
-  const response = await fetch(
-    `https://api.hubapi.com/crm/v3/objects/companies/${companyId}?properties=name,domain`,
+  const response = await hubspotFetch(
+    'https://api.hubapi.com/crm/v3/objects/companies/batch/read',
     {
-      method: 'GET',
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${hubspotKey}`,
         'Content-Type': 'application/json'
-      }
+      },
+      body: JSON.stringify({
+        properties: ['name', 'domain'],
+        inputs: companyIds.map(id => ({ id }))
+      })
     }
   );
 
   if (!response.ok) {
-    throw new Error(`HubSpot API error fetching company ${companyId}: ${response.status}`);
+    throw new Error(`HubSpot API error fetching companies: ${response.status}`);
   }
 
   const data = await response.json();
-  return {
-    id: companyId,
-    name: data.properties?.name || 'Unknown',
-    domain: data.properties?.domain || null
-  };
+
+  // Return as map: { id: { id, name, domain } }
+  const companyMap = {};
+  for (const result of data.results || []) {
+    companyMap[result.id] = {
+      id: result.id,
+      name: result.properties?.name || 'Unknown',
+      domain: result.properties?.domain || null
+    };
+  }
+  return companyMap;
 }
 
 // HubSpot API: Update contact property
 async function updateContactProperty(contactId, property, value) {
   const hubspotKey = process.env.HUBSPOT_API_KEY;
 
-  const response = await fetch(
+  const response = await hubspotFetch(
     `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
     {
       method: 'PATCH',
@@ -174,7 +203,7 @@ async function createNote(contactId, noteBody) {
   const hubspotKey = process.env.HUBSPOT_API_KEY;
 
   // Create the note
-  const createResponse = await fetch(
+  const createResponse = await hubspotFetch(
     'https://api.hubapi.com/crm/v3/objects/notes',
     {
       method: 'POST',
@@ -199,7 +228,7 @@ async function createNote(contactId, noteBody) {
   const noteId = noteData.id;
 
   // Associate note with contact
-  const associateResponse = await fetch(
+  const associateResponse = await hubspotFetch(
     `https://api.hubapi.com/crm/v3/objects/notes/${noteId}/associations/contacts/${contactId}/note_to_contact`,
     {
       method: 'PUT',
@@ -248,11 +277,12 @@ app.post('/audit-note', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'No valid removed company IDs provided' });
     }
 
-    // Fetch company details from HubSpot (primary + all removed in parallel)
-    const [primaryCompany, ...removedCompanies] = await Promise.all([
-      getCompanyDetails(primaryCompanyId),
-      ...removedIds.map(id => getCompanyDetails(id))
-    ]);
+    // Fetch all company details in single batch request
+    const allCompanyIds = [primaryCompanyId, ...removedIds];
+    const companyMap = await batchGetCompanies(allCompanyIds);
+
+    const primaryCompany = companyMap[primaryCompanyId] || { id: primaryCompanyId, name: 'Unknown', domain: null };
+    const removedCompanies = removedIds.map(id => companyMap[id] || { id, name: 'Unknown', domain: null });
 
     const timestamp = new Date().toISOString();
 
